@@ -4,6 +4,7 @@
 
 import { useSearchParams } from 'next/navigation';
 import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
 
 import { GetBangumiCalendarData } from '@/lib/bangumi.client';
 import {
@@ -12,7 +13,7 @@ import {
   getDoubanRecommends,
 } from '@/lib/douban.client';
 import { DoubanItem, DoubanResult } from '@/lib/types';
-import { generateCacheKey, globalCache } from '@/lib/unified-cache';
+import { generateCacheKey } from '@/lib/unified-cache';
 import { useSourceFilter } from '@/hooks/useSourceFilter';
 
 import DoubanCardSkeleton from '@/components/DoubanCardSkeleton';
@@ -20,6 +21,8 @@ import DoubanCustomSelector from '@/components/DoubanCustomSelector';
 import DoubanSelector, { SourceCategory } from '@/components/DoubanSelector';
 import PageLayout from '@/components/PageLayout';
 import VideoCard from '@/components/VideoCard';
+
+import { useGlobalCache } from '@/contexts/GlobalCacheContext';
 
 function DoubanPageClient() {
   const searchParams = useSearchParams();
@@ -33,6 +36,12 @@ function DoubanPageClient() {
   const loadingRef = useRef<HTMLDivElement>(null);
   const debounceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
+  const type = searchParams.get('type') || 'movie';
+
+  // === 智能防抖追踪（必须在 type 定义之后）===
+  const isFirstMount = useRef(true);
+  const prevTypeRef = useRef(type);
+
   // 用于存储最新参数值的 refs
   const currentParamsRef = useRef({
     type: '',
@@ -43,7 +52,13 @@ function DoubanPageClient() {
     currentPage: 0,
   });
 
-  const type = searchParams.get('type') || 'movie';
+  // === 接入全局缓存 ===
+  const {
+    getDoubanData,
+    setDoubanData: setGlobalDoubanData,
+    isDoubanLoading,
+    setDoubanLoading,
+  } = useGlobalCache();
 
   // 获取 runtimeConfig 中的自定义分类数据
   const [customCategories, setCustomCategories] = useState<
@@ -291,15 +306,27 @@ function DoubanPageClient() {
       ...multiLevelValues,
     });
 
-    // 尝试从缓存读取
-    const cachedData = globalCache.get<DoubanItem[]>(cacheKey);
-    if (cachedData && cachedData.length > 0) {
-      console.log(`[DoubanPage] 缓存命中: ${cacheKey}`);
-      setDoubanData(cachedData);
-      setLoading(false);
-      setHasMore(cachedData.length >= 25);
+    // 【防止并发】检查是否正在加载
+    if (isDoubanLoading(cacheKey)) {
       return;
     }
+
+    // 【缓存优先】尝试从全局内存缓存读取
+    const cachedData = getDoubanData(cacheKey);
+    if (cachedData && cachedData.length > 0) {
+      // 缓存命中：使用 flushSync 强制同步更新 DOM，实现毫秒级渲染
+      flushSync(() => {
+        setDoubanData(cachedData);
+        setLoading(false);
+        setHasMore(cachedData.length >= 25);
+        setCurrentPage(0);
+      });
+      return;
+    }
+
+    // 【无缓存】标记为正在加载，显示骨架屏
+    setDoubanLoading(cacheKey, true);
+    setLoading(true);
 
     try {
       setLoading(true);
@@ -406,17 +433,17 @@ function DoubanPageClient() {
         const currentSnapshot = { ...currentParamsRef.current };
 
         if (isSnapshotEqual(requestSnapshot, currentSnapshot)) {
-          setDoubanData(data.list);
-          setHasMore(data.list.length !== 0);
-          setLoading(false);
+          // 使用 flushSync 确保状态同步更新，避免批处理延迟
+          flushSync(() => {
+            setDoubanData(data.list);
+            setHasMore(data.list.length !== 0);
+            setLoading(false);
+          });
 
-          // 【缓存写入】保存到缓存，下次瞬间加载
+          // 【全局缓存写入】保存到全局 Context 缓存，下次瞬间加载
           if (data.list.length > 0) {
-            globalCache.set(cacheKey, data.list, 3600); // 1小时缓存
-            console.log(`[DoubanPage] 缓存写入: ${cacheKey}`);
+            setGlobalDoubanData(cacheKey, data.list);
           }
-        } else {
-          console.log('参数不一致，不执行任何操作，避免设置过期数据');
         }
         // 如果参数不一致，不执行任何操作，避免设置过期数据
       } else {
@@ -425,6 +452,9 @@ function DoubanPageClient() {
     } catch (err) {
       console.error(err);
       setLoading(false); // 发生错误时总是停止loading状态
+    } finally {
+      // 清除加载状态
+      setDoubanLoading(cacheKey, false);
     }
   }, [
     type,
@@ -434,9 +464,13 @@ function DoubanPageClient() {
     selectedWeekday,
     getRequestParams,
     customCategories,
+    getDoubanData,
+    setGlobalDoubanData,
+    isDoubanLoading,
+    setDoubanLoading,
   ]);
 
-  // 只在选择器准备好后才加载数据
+  // 只在选择器准备好后才加载数据 - 智能防抖
   useEffect(() => {
     // 只有在选择器准备好时才开始加载
     if (!selectorsReady) {
@@ -455,10 +489,25 @@ function DoubanPageClient() {
       clearTimeout(debounceTimeoutRef.current);
     }
 
-    // 使用防抖机制加载数据，避免连续状态更新触发多次请求
-    debounceTimeoutRef.current = setTimeout(() => {
+    // 【智能防抖】判断是否需要立即执行
+    const typeChanged = prevTypeRef.current !== type;
+    const shouldExecuteImmediately = isFirstMount.current || typeChanged;
+
+    // 更新追踪状态
+    prevTypeRef.current = type;
+    if (isFirstMount.current) {
+      isFirstMount.current = false;
+    }
+
+    if (shouldExecuteImmediately) {
+      // 首次挂载或 Tab 切换：立即执行，利用缓存实现 0 延迟
       loadInitialData();
-    }, 100); // 100ms 防抖延迟
+    } else {
+      // 筛选条件变化：使用防抖，防止用户快速点击
+      debounceTimeoutRef.current = setTimeout(() => {
+        loadInitialData();
+      }, 100);
+    }
 
     // 清理函数
     return () => {
